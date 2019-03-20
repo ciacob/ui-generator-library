@@ -1,170 +1,341 @@
 package ro.ciacob.desktop.ui {
-	import flash.events.Event;
+	import flash.display.DisplayObject;
+	import flash.display.DisplayObjectContainer;
 	import flash.events.EventDispatcher;
 	import flash.utils.describeType;
 	
-	import mx.controls.Label;
-	import mx.controls.Spacer;
-	import mx.core.ClassFactory;
-	import mx.core.FlexGlobals;
-	import mx.core.IContainer;
-	import mx.core.IUIComponent;
-	import mx.core.UIComponent;
-	import mx.events.FlexEvent;
-	import mx.styles.CSSStyleDeclaration;
-	import mx.styles.IStyleManager2;
-	import mx.utils.ObjectUtil;
+	import ro.ciacob.desktop.ui.utils.CommonStrings;
+	import ro.ciacob.desktop.ui.utils.Strings;
 	
-	import spark.components.CheckBox;
-	import spark.components.ComboBox;
-	
-	import ro.ciacob.ui.flex.NonEditableNumericStepper;
-	import ro.ciacob.ui.flex.PickupComponent;
-	import ro.ciacob.utils.Strings;
-	import ro.ciacob.utils.constants.CommonStrings;
 
 	/**
 	 * Reference implementation for the IUIGenerator interface.
 	 * @see IUIGenerator
 	 */
-	public class UIGenerator extends EventDispatcher implements IUIGenerator {
+	public class UiGenerator extends EventDispatcher implements IUiGenerator {
 
-
-		public function UIGenerator() {
+		/**
+		 * @constructor
+		 * @see IUIGenerator
+		 * @see IUiBuilder
+		 * 
+		 * @param	builder
+		 * 			Class definition of an IUiBuilder implementor to handle the actual building work. 
+		 */
+		public function UiGenerator (builder : Class) {
+			_builderClass = builder;
 		}
 
-		private var _callback:Function;
-		private var _controlsLookupTable:Array;
-		private var _isGenerating:Boolean;
-		private var _originator:Object;
-		private var _target:IContainer;
-		private var _typeInfo:XML;
-		private var _labelsMap:Object = {};
-		private var _uiMap:Object;
-		private var _uiBindingsMap:Object;
-		private var styleManager:IStyleManager2;
+		private var _builderClass : Class;
+		private var _builder : IUiBuilder;
+		private var _queueCompletionCallback : Function;
+		private var _externalChangeCallback : Function;
+		private var _isGenerating : Boolean;
+		private var _originator : Object;
+		private var _uiMap:Object = {};
+		private var _friendlyNamesMap : Object = {};
+		private var _uiComponentBlueprints : Array = []; 
 		
-		// Component factories
-		private var _checkBoxFactory:ClassFactory=new ClassFactory(CheckBox);
-		private var _labelFactory:ClassFactory=new ClassFactory(Label);
-		private var _numericStepperFactory:ClassFactory=new ClassFactory(NonEditableNumericStepper);
-		private var _comboBoxFactory:ClassFactory=new ClassFactory(ComboBox);
-		private var _pickupFactory:ClassFactory=new ClassFactory(PickupComponent);
-		private var _spacerFactory:ClassFactory=new ClassFactory(Spacer);
-		
-		private static const READ_ACCESS:String = 'readonly';
-		private static const READ_WRITE_ACCESS:String = 'readwrite';
-		private static const SRC_SUFFIX:String = 'Src';
-		private static const BOUND_EVENT:String='boundEvent';
-		private static const BOUND_FUNCTION:String='boundFunction';
+		private static const READ_ACCESS : String = 'readonly';
+		private static const READ_WRITE_ACCESS : String = 'readwrite';
+		private static const SRC_SUFFIX : String = 'Src';
+		private static const expectedMetadataNames : Array = [
+			BlueprintKeys.INDEX,
+			BlueprintKeys.DESCRIPTION,
+			BlueprintKeys.MINIMUM,
+			BlueprintKeys.MAXIMUM,
+			BlueprintKeys.CUSTOM_COMPONENT
+		];
 
+		/**
+		 * Returns the value of the `isGenerating` flag. Generating the UI is caried out in sessons, where each
+		 * session must completely finish before another one can start.
+		 * 
+		 * The client code can both check for the `isGenerating` flag value and provide a "callback" argument 
+		 * to the `generate()` function to cope with this limitation.
+		 */
 		public function get isGenerating () : Boolean {
 			return _isGenerating;
 		}
 		
-		public function generate(originator:Object, target:IContainer, callback:Function):Boolean {
+		/**
+		 * Provides a faster alternative to <<container>>.getChildByName (<<accessorName>>) for retrieving an
+		 * instance of a generated UI component. Each new generating session overrides the previous one, 
+		 * therefore only the UI components generated in the latest session are available. Can return `null`
+		 * if no such component exists.
+		 */
+		public function getComponentByName (name : String) : DisplayObject {
+			return (_uiMap[name] as DisplayObject);
+		}
+		
+		/**
+		 * Starts the generating process, if not already running and sets the public flag "isGenerating" accordingly.
+		 * if generation is already in progress, nothing happens.
+		 * @seeIUIGenerator.generate
+		 */
+		public function generate (originator : Object, container : DisplayObjectContainer, onComplete : Function, onChange : Function = null) : void {
 			if (!_isGenerating) {
 				_isGenerating = true;
-				styleManager = ('styleManager' in _target)? _target['styleManager'] as IStyleManager2 : 
-					(FlexGlobals.topLevelApplication && ('styleManager' in FlexGlobals.topLevelApplication))? 
-						FlexGlobals.topLevelApplication['styleManager'] as IStyleManager2 :
-							null;
-					
 				_originator = originator;
-				_target = target;
-				_callback = callback;
-				_typeInfo = describeType(originator);
-				_controlsLookupTable = _extractControls(_typeInfo);
-				_generateControls();
-				return true;
+				_queueCompletionCallback = onComplete;
+				_externalChangeCallback = onChange;
+				var typeInfo : XML = describeType (_originator);
+				
+				// If the originator is a simple Object, do a best effort guessing to produce
+				// an acceptable list of blueprints for the components to be generated. This
+				// situation is far from ideal, because information is scarce -- `describeType()`
+				// does not work on simple Objects -- and binding is unavailable.
+				if (typeInfo.@name == 'Object' || 
+					(typeInfo.@base == 'Object' && typeInfo.@isDynamic == 'true')) {
+					_uiComponentBlueprints = _inferBlueprints (_originator);
+				}
+				
+				// If the originator is a custom class, all the needed information is
+				// contained in the type description, and we only need to extract and
+				// organize it.
+				else {
+					_uiComponentBlueprints = _extractBlueprints (typeInfo);
+				}
+				
+				// Sort blueprints by index if given, or alphabetically by their labels (default)
+				_uiComponentBlueprints.sort (_compareBlueprints);
+				
+				// Initialize given builder
+				_builder = new _builderClass (_originator, container, _generateNext, _onUserChange);
+				
+				// Start building the components
+				_uiMap = {};
+				_builder.purgeContainer();		
+				_generateNext();
 			}
-			return false;
 		}
 
-		private function _bindControl(control:IUIComponent):void {
+		/**
+		 * "Guesses" the UI components to be generated based on the enumerable
+		 * properties  defined on a simple Object
+		 */
+		private function _inferBlueprints (originator : Object) : Array {
+			var key : String;
+			var value : Object;
+			var type : String;
+			var friendlyName : String;
+			var bluePrint : Object;
+			var matchingTargetName : String;
+			var matchingSourceName : String;
+			var additionalKey : String;
+			var blueprints : Array = [];
+			var additionalConfig : Object;
+			
+			for (key in originator) {
+				
+				// Filter out keys that start with a '$' sign
+				if (key.charAt(0) != '$') {
+				
+					// Filter out properties inherited from the prototype chain
+					if (originator.hasOwnProperty(key)) {
+						value = originator[key];
+						
+						// Filter out unsupported types
+						type = (value is int)? SupportedTypes.INT:
+							(value is uint)? SupportedTypes.UINT:
+							(value is Number)? SupportedTypes.NUMBER:
+							(value is Boolean)? SupportedTypes.BOOLEAN:
+							(value is String)? SupportedTypes.STRING:
+							((value is Array) && value.constructor == Array)? SupportedTypes.ARRAY:
+							((value is Object) && value.constructor == Object)? SupportedTypes.OBJECT:
+							null;
+						
+						// Filter out "source" properties (properties which have no other purpose than to provide
+						// the options to populate the selection lists with)
+						if (type == SupportedTypes.ARRAY && Strings.endsWith (key, SRC_SUFFIX)) {
+							matchingTargetName = key.slice(0, SRC_SUFFIX.length * -1);
+							if (matchingTargetName in originator) {
+								continue;
+							}
+						}
+						
+						// Filter out the configuration property
+						if (key == BlueprintKeys.UI_GENERATOR_CONFIG) {
+							continue;
+						}
+						
+						// Construct a blueprint out of the data we gathered so far
+						if (type != null) {
+							bluePrint = {};
+							bluePrint[BlueprintKeys.NAME] = key;
+							friendlyName = Strings.capitalize(Strings.deCamelize (key));
+							friendlyName = friendlyName.split (CommonStrings.UNDERSCORE).join (CommonStrings.SPACE);
+							bluePrint[BlueprintKeys.LABEL] = friendlyName;
+							bluePrint[BlueprintKeys.TYPE] = type;
+							bluePrint[BlueprintKeys.DEFAULT] = value;
+							
+							// Grab the options to populate selection lists with; these are needed for accessors
+							// of type Object or Array
+							if (type == SupportedTypes.OBJECT || type == SupportedTypes.ARRAY) {
+								matchingSourceName = key.concat(SRC_SUFFIX);
+								if (matchingSourceName in originator) {
+									bluePrint[BlueprintKeys.SOURCE] = originator[matchingSourceName];
+								}
+							}
+							
+							// Grab additional configuration if given
+							if (BlueprintKeys.UI_GENERATOR_CONFIG in originator) {
+								additionalConfig = originator[BlueprintKeys.UI_GENERATOR_CONFIG][key];
+								for (additionalKey in additionalConfig) {
+									if (expectedMetadataNames.indexOf(additionalKey) != -1) {
+										bluePrint[additionalKey] = additionalConfig[additionalKey];
+									}
+								}
+							}
+							
+							// Store the blueprint
+							blueprints.push (bluePrint);
+						}
+					}
+				}
+			}
+			
+			
+			return blueprints;
 		}
-
-		private function _extractControls(typeDescription:XML):Array {
-			var ret:Array = [];
-			var typeLocalName:String = typeDescription.@name.toString();
-			var ownAccessors:XMLList = typeDescription..accessor.(@declaredBy == typeLocalName);
-			for each (var accessor:XML in ownAccessors) {
-				var aName:String = accessor.@name.toString();
-				if (!Strings.beginsWith(aName, '$')) {
-					var accessType:String = accessor.@access.toString();
+		
+		/**
+		 * Digests the XML produced by "describeType()" in a concise Array of "blueprint"
+		 * Objects, where each Object provides essential information for rendering one UI
+		 * Component.
+		 */
+		private function _extractBlueprints (typeInfo : XML) : Array {
+			var i : int;
+			var j : int;
+			var k : int;
+			var L : int;
+			var accessor : XML;
+			var accessorName : String;
+			var accessType : String;
+			var friendlyName:String;
+			var accessorType:String;
+			var bluePrint : Object;
+			var matchingSource : XML;
+			var sourceAccessType : String;
+			var sourceGetterName : String;
+			
+			var metadataNodes : XMLList;
+			var numMetadataNodes : uint;
+			var metadataNode : XML;
+			var metadataName : String;
+			
+			var customComponentMetadata : Object;
+			
+			var argNodes : XMLList;
+			var numArgNodes : uint;
+			var argNode : XML;
+			var argKey : String;
+			var argValue : String;
+			
+			var description : String;
+			var matchingSources:XMLList;
+			var blueprints : Array = [];
+			var typeLocalName : String = typeInfo.@name.toString();
+			var accessors : XMLList = typeInfo..accessor.(@declaredBy == typeLocalName);
+			var numAccessors : uint = accessors.length();
+			for (i = 0; i < numAccessors; i++) {
+				accessor = accessors[i] as XML;
+				accessorName = accessor.@name.toString();
+				if (accessorName.charAt(0) != '$') {
+					accessType = accessor.@access.toString();
 					if (accessType == READ_WRITE_ACCESS) {
-						var expandedName:String = Strings.properCase(Strings.deCamelize(aName));
-						_labelsMap[aName] = expandedName;
-						var type:String = accessor.@type.toString();
-						if (Strings.isAny (type, 
+						friendlyName = Strings.capitalize(Strings.deCamelize (accessorName));
+						friendlyName = friendlyName.split (CommonStrings.UNDERSCORE).join (CommonStrings.SPACE);
+						_friendlyNamesMap[accessorName] = friendlyName;
+						accessorType = accessor.@type.toString();
+						if (Strings.isAny (accessorType, 
 							SupportedTypes.INT,
+							SupportedTypes.UINT,
 							SupportedTypes.NUMBER,
 							SupportedTypes.BOOLEAN,
 							SupportedTypes.STRING,
 							SupportedTypes.ARRAY,
 							SupportedTypes.OBJECT
 						)) {
-							var endPoint:Object = {};
-							endPoint[EndPointKeys.NAME] = aName;
-							endPoint[EndPointKeys.LABEL] = expandedName;
-							endPoint[EndPointKeys.TYPE] = type;
-							endPoint[EndPointKeys.DEFAULT] = this[aName];
-							var matchingSources:XMLList = typeDescription..accessor.
-								(@name == aName.concat(SRC_SUFFIX));
+							bluePrint = {};
+							bluePrint[BlueprintKeys.NAME] = accessorName;
+							bluePrint[BlueprintKeys.LABEL] = friendlyName;
+							bluePrint[BlueprintKeys.TYPE] = accessorType;
+							bluePrint[BlueprintKeys.DEFAULT] = _originator[accessorName];
+							
+							// Grab the options to populate selection lists with; these are needed for accessors
+							// of type Object or Array
+							matchingSources = typeInfo..accessor.(@name == accessorName.concat(SRC_SUFFIX));
 							if (matchingSources.length() > 0) {
-								var srcNode:XML = (matchingSources[0] as XML);
-								var srcAccessType:String = srcNode.@access.toString();
-								if (srcAccessType == READ_ACCESS) {
-									var srcGetterName:String = srcNode.@name.toString();
-									endPoint[EndPointKeys.SOURCE] = (this[srcGetterName] as
-										Array);
+								matchingSource = (matchingSources[0] as XML);
+								sourceAccessType = matchingSource.@access.toString();
+								if (sourceAccessType == READ_ACCESS) {
+									sourceGetterName = matchingSource.@name.toString();
+									bluePrint[BlueprintKeys.SOURCE] = (_originator[sourceGetterName] as Array);
 								}
 							}
-							var meta:XMLList = accessor.metadata;
-							if (meta.length() > 0) {
-								var expectedMetaNames:Array = [
-									EndPointKeys.INDEX,
-									EndPointKeys.DESCRIPTION,
-									EndPointKeys.MINIMUM,
-									EndPointKeys.MAXIMUM,
-									EndPointKeys.ADVANCED,
-									EndPointKeys.LIST_FONT_SIZE,
-									EndPointKeys.EDITOR_FONT_SIZE,
-									EndPointKeys.UNIQUE_SELECTION,
-									EndPointKeys.DEPENDS_ON
-								];
-								for (var i:int = 0; i < expectedMetaNames.length; i++) {
-									var nodeName:String = (expectedMetaNames[i] as String);
-									var metaNode:XMLList = accessor.metadata.(@name == nodeName);
-									if (metaNode.length() > 0) {
-										var key:String = nodeName;
-										var value:String = null;
-										var args:XMLList = metaNode.arg;
-										if (args.length() > 0) {
-											value = Strings.trim((args[0] as XML).@value);
-										}
-										endPoint[key] = value;
+							
+							// Read the additional metadata if given
+							metadataNodes = accessor.metadata;
+							numMetadataNodes = metadataNodes.length();
+							for (j = 0; j < numMetadataNodes; j++) {
+								metadataNode = metadataNodes[j] as XML;
+								metadataName = String (metadataNode.@name);
+								if (expectedMetadataNames.indexOf(metadataName) == -1) {
+									continue;
+								}
+								argNodes = metadataNode.arg;
+								numArgNodes = argNodes.length();
+								
+								// The "CustomComponent" metadata accepts an arbitrary number
+								// of arguments, therefore its value will be an Object
+								// populated with the keys and values of all available
+								// arguments
+								if (metadataName == BlueprintKeys.CUSTOM_COMPONENT) {
+									customComponentMetadata = {};
+									for (L = 0; L < numArgNodes; L++) {
+										argNode = argNodes[L] as XML;
+										argKey = Strings.trim (argNode.@key);
+										argValue = Strings.trim (argNode.@value);
+										customComponentMetadata[argKey] = argValue;
+									}
+									bluePrint[metadataName] = customComponentMetadata;
+								}
+								
+								// The rest of the supported metadata tags only expect
+								// one argument named "value", therefore they will be
+								// listed by their metadata tag name and the "value" of
+								// their first argument
+								else {
+									if (numArgNodes != 0) {
+										argNode =  argNodes[0] as XML;
+										argValue = Strings.trim (argNode.@value);
+										bluePrint[metadataName] = argValue;
 									}
 								}
 							}
-							ret.push(endPoint);
+							blueprints.push (bluePrint);
 						}
 					}
 				}
 			}
-			for (var j:int = 0; j < ret.length; j++) {
-				var el:Object = ret[j];
-				if (EndPointKeys.DESCRIPTION in el) {
-					var desc:String = (el[EndPointKeys.DESCRIPTION] as String);
-					desc = _expandNames(desc);
-					el[EndPointKeys.DESCRIPTION] = desc;
+			
+			// If a description is given for an accessor, it can use the special syntax [accessorName]
+			// to make a reference to another (related) accessor. Here we expand these references to 
+			// the accessor's "friendly" name.
+			for (k = 0; k < blueprints.length; k++) {
+				bluePrint = blueprints[k];
+				if (BlueprintKeys.DESCRIPTION in bluePrint) {
+					description = (bluePrint[BlueprintKeys.DESCRIPTION] as String);
+					description = _expandNames(description);
+					bluePrint[BlueprintKeys.DESCRIPTION] = description;
 				}
 			}
-			return ret;
+			return blueprints;
 		}
 		
 		/**
-		 * Replaces '[myEndPoint]' with 'My end point' within the given string.
+		 * Replaces '[myOtherAccessor]' with «My Other Accessor» within the given string.
 		 *
 		 * @param	text
 		 * 			The text to search and replace in.
@@ -173,10 +344,10 @@ package ro.ciacob.desktop.ui {
 		 */
 		private function _expandNames(text:String):String {
 			if (!Strings.isEmpty(text)) {
-				for (var name:String in _labelsMap) {
+				for (var name:String in _friendlyNamesMap) {
 					var pSegm:Array = ['\\[', name, '\\]'];
 					var pattern:RegExp = new RegExp(pSegm.join(''), 'g');
-					var replacement:String = (['«', _labelsMap[name] as String, '»']).
+					var replacement:String = (['«', _friendlyNamesMap[name] as String, '»']).
 						join('');
 					text = text.replace(pattern, replacement);
 				}
@@ -184,241 +355,57 @@ package ro.ciacob.desktop.ui {
 			return text;
 		}
 
-		private function _compareElementsByIndex(elA:Object, elB:Object):int {
-			var indexA:int=(parseInt(elA[EndPointKeys.INDEX]) as int);
-			var indexB:int=(parseInt(elB[EndPointKeys.INDEX]) as int);
-			return (indexA - indexB);
+		
+		/**
+		 *  Compares two blueprints based on their index
+		 */
+		private function _compareBlueprints (blueprintA : Object, blueprintB : Object) : int {
+			var indexA : int = (parseInt (blueprintA[BlueprintKeys.INDEX]) as int);
+			var indexB : int = (parseInt (blueprintB[BlueprintKeys.INDEX]) as int);
+			var numericOrder : int = (indexA - indexB);
+			if (!numericOrder) {
+				var labelA : String = blueprintA[BlueprintKeys.LABEL] as String;
+				var labelB : String = blueprintB[BlueprintKeys.LABEL] as String;
+				return (labelA > labelB)? 1 : (labelA < labelB)? -1 : 0;
+			}
+			return numericOrder;
 		}
 		
-		private function _generateControls():void {
-			_uiMap={};
-			_uiBindingsMap={};			
-			_controlsLookupTable.sort(_compareElementsByIndex);
-			_generateNext();
+		/**
+		 * Causes the next UI Component in the queue to be generated.
+		 */
+		private function _generateNext() : void {
+			var i : int = 0;
+			var elBlueprint : Object = null;
+			var key : String = null;
+			if (_uiComponentBlueprints.length > 0) {
+				elBlueprint = _uiComponentBlueprints.shift();
+				key = elBlueprint[BlueprintKeys.NAME];
+				var control : DisplayObject = _builder.buildUiElement (elBlueprint);
+				
+				// If a component was successfully built out of the current item
+				// in the queue, register it and wait for it to render before moving on;
+				// otherwise just skip to the next item in the queue.
+				if (control != null) {
+					_uiMap[key] = control;
+				} else {
+					_generateNext();
+				}
+			} else {
+				_isGenerating = false;
+				_queueCompletionCallback();
+			}
 		}
 
-		private function _generateNext():void {
-			var i:int=0;
-			var elBlueprint:Object=null;
-			var key:String=null;
-			if (_controlsLookupTable.length > 0) {
-				elBlueprint = _controlsLookupTable.shift();
-				key=elBlueprint[EndPointKeys.NAME];
-				var control:IUIComponent = _buildUiElement(elBlueprint, _target);
-				_uiMap[key]=control;
-				control.addEventListener(FlexEvent.UPDATE_COMPLETE, _onGeneratedControlDrawn);
-			} else {
-				_callback.apply();
-				_isGenerating = false;
-			}
-		}
-		
-		private function _onGeneratedControlDrawn (event : FlexEvent) : void {
-			var target : IUIComponent = IUIComponent(event.target);
-			target.removeEventListener(FlexEvent.UPDATE_COMPLETE, _onGeneratedControlDrawn);
-			_generateNext();
-		}
-		
-		private function _buildUiElement(blueprint:Object, container:IContainer):UIComponent {
-			
-			var name:String=(blueprint[EndPointKeys.NAME] as String);
-			var type:String=(blueprint[EndPointKeys.TYPE] as String);
-			var label:String=(blueprint[EndPointKeys.LABEL] as String);
-			var description:String=Strings.trim(blueprint[EndPointKeys.DESCRIPTION] as String);
-			
-			// Base property set
-			var baseProps:Object={};
-			baseProps['percentWidth']=100;
-			
-			// Create a separate label for the component, unless it is a CheckBox
-			if (type != SupportedTypes.BOOLEAN) {
-				
-				// Label base property set 
-				var labelBaseProps:Object=ObjectUtil.clone(baseProps);
-				delete labelBaseProps['uid'];
-				labelBaseProps['truncateToFit']=true;
-				
-				// Current label property set
-				var labelProps:Object=ObjectUtil.clone(labelBaseProps);
-				delete labelProps['uid'];
-				labelProps['text']=label.concat(CommonStrings.COLON_SPACE);
-				if (!Strings.isEmpty(description)) {
-					labelProps['toolTip']=description;
-				}
-				
-				// Create a label for the control
-				_labelFactory.properties=labelProps;
-				container.addChild(_labelFactory.newInstance() as UIComponent);
-			}
-			
-			// Create the actual component
-			var component:UIComponent;
-			var bindData:Object;
-			var source:Array;
-			switch (type) {
-				
-				// Draw a CheckBox for a Boolean accessor
-				case SupportedTypes.BOOLEAN:
-					var cbProps:Object=ObjectUtil.clone(baseProps);
-					delete cbProps['uid'];
-					cbProps['name']=name;
-					cbProps['label']=label;
-					cbProps['toolTip']=description;
-					_checkBoxFactory.properties=cbProps;
-					component=_checkBoxFactory.newInstance();
-					component.addEventListener(Event.CHANGE, _onCbChange);
-					bindData={};
-					bindData[BOUND_EVENT]=Event.CHANGE;
-					bindData[BOUND_FUNCTION]=_onCbChange;
-					_uiBindingsMap[name]=bindData;
-					break;
-				
-				// Draw a NumericStepper for a Number or int accessor
-				case SupportedTypes.NUMBER:
-				case SupportedTypes.INT:
-					var stepperProps:Object=ObjectUtil.clone(baseProps);
-					delete stepperProps['uid'];
-					stepperProps['name']=name;
-					var minimum:Number=parseFloat(blueprint[EndPointKeys.MINIMUM]);
-					if (!isNaN(minimum)) {
-						stepperProps['minimum']=minimum;
-					}
-					var maximum:Number=parseFloat(blueprint[EndPointKeys.MAXIMUM]);
-					if (!isNaN(maximum)) {
-						stepperProps['maximum']=maximum;
-					}
-					if (type == SupportedTypes.NUMBER) {
-						stepperProps['stepSize']=0.05;
-						var isPercentage:Boolean=(minimum >= 0 && maximum <= 1);
-						if (isPercentage) {
-							stepperProps['formattingFunction']=Strings.toPercentageFormat;
-						}
-					} else {
-						stepperProps['stepSize']=1;
-					}
-					_numericStepperFactory.properties=stepperProps;
-					component=_numericStepperFactory.newInstance();
-					component.addEventListener(Event.CHANGE, _onNsChange);
-					bindData={};
-					bindData[BOUND_EVENT]=Event.CHANGE;
-					bindData[BOUND_FUNCTION]=_onNsChange;
-					_uiBindingsMap[name]=bindData;
-					break;
-				
-				// Draw a PickupComponent for an Array accessor; its source is read from a [sameName]Src getter of type Array
-				case SupportedTypes.ARRAY:
-					var pickupProps:Object=ObjectUtil.clone(baseProps);
-					delete pickupProps['uid'];
-					pickupProps['name']=name;
-					pickupProps['editorTitle']=label;
-					var listFontSize:Number=parseInt(blueprint[EndPointKeys.LIST_FONT_SIZE]);
-					if (!isNaN(listFontSize)) {
-						var listStyle:CSSStyleDeclaration=new CSSStyleDeclaration;
-						listStyle.setStyle('fontSize', listFontSize);
-						var listStyleName:String=CommonStrings.DOT.concat(blueprint[EndPointKeys.NAME], CommonStrings.UNDERSCORE, EndPointKeys.LIST_FONT_SIZE);
-						if (styleManager) {
-							styleManager.setStyleDeclaration(listStyleName, listStyle, false);
-						}
-						pickupProps['itemStyleName']=listStyleName;
-					}
-					var editorFontSize:Number=parseInt(blueprint[EndPointKeys.EDITOR_FONT_SIZE]);
-					if (!isNaN(editorFontSize)) {
-						var editorStyle:CSSStyleDeclaration=new CSSStyleDeclaration;
-						editorStyle.setStyle('fontSize', editorFontSize);
-						var editorStyleName:String=CommonStrings.DOT.concat(blueprint[EndPointKeys.NAME], CommonStrings.UNDERSCORE, EndPointKeys.EDITOR_FONT_SIZE);
-						if (styleManager) {
-							styleManager.setStyleDeclaration(editorStyleName, editorStyle, false);
-						}
-						pickupProps['editorItemStyleName']=editorStyleName;
-					}
-					source=(blueprint[EndPointKeys.SOURCE] as Array);
-					if (source != null) {
-						pickupProps['availableItems']=source;
-						source=null;
-					}
-					_pickupFactory.properties=pickupProps;
-					component=_pickupFactory.newInstance();
-					component.addEventListener(Event.CHANGE, _onPickUpChange);
-					bindData={};
-					bindData[BOUND_EVENT]=Event.CHANGE;
-					bindData[BOUND_FUNCTION]=_onPickUpChange;
-					_uiBindingsMap[name]=bindData;
-					break;
-				
-				// An Object Accessor needs further refinement via metadata values
-				case SupportedTypes.OBJECT:
-					
-					// Draw a BomboBox for an Object accessor that has a "UniqueSelection" metadata; its
-					// choices are read from a [sameName]Src getter of type Array
-					var hasUniqueSelection:Boolean=(EndPointKeys.UNIQUE_SELECTION in blueprint);
-					if (hasUniqueSelection) {
-						
-						// Draw a ComboBox
-						var comboProps:Object=ObjectUtil.clone(baseProps);
-						delete comboProps['uid'];
-						comboProps['name']=name;
-						comboProps['labelField']='label';
-						source=(blueprint[EndPointKeys.SOURCE] as Array);
-						if (source != null) {
-							comboProps['dataProvider']=source;
-							source=null;
-						}
-						_comboBoxFactory.properties=comboProps;
-						component=_comboBoxFactory.newInstance();
-						component.addEventListener(Event.CHANGE, _onComboChange);
-						bindData={};
-						bindData[BOUND_EVENT]=Event.CHANGE;
-						bindData[BOUND_FUNCTION]=_onComboChange;
-						_uiBindingsMap[name]=bindData;
-					}
-					
-					break;
-			}
-			
-			// Add the generated component and return it
-			if (component != null) {
-				container.addChild(component);
-				
-				// Add a spacer after the component
-				var spacerProps:Object={'height': 15};
-				_spacerFactory.properties=spacerProps;
-				var spacer:UIComponent=_spacerFactory.newInstance();
-				container.addChild(spacer);
-			}
-			return component;
-		}
-		
-		private function _onCbChange(event:Event):void {
-			var cb:CheckBox=(event.target as CheckBox);
-			var key:String=cb.name;
-			var value:Boolean=cb.selected;
-			_registerUserChange(key, value);
-		}
-		
-		private function _onNsChange(event:Event):void {
-			var ns:NonEditableNumericStepper=(event.target as NonEditableNumericStepper);
-			var key:String=ns['name'];
-			var value:Number=ns['value'];
-			_registerUserChange(key, value);
-		}
-		
-		private function _onPickUpChange(event:Event):void {
-			var pickup:PickupComponent=(event.target as PickupComponent);
-			var key:String=pickup['name'];
-			var value:Array=pickup.pickedUpItems.concat();
-			_registerUserChange(key, value);
-		}
-		
-		private function _onComboChange(event:Event):void {
-			var combo:ComboBox=(event.target as ComboBox);
-			var key:String=combo.name;
-			var value:Object=combo.selectedItem;
-			_registerUserChange(key, value);
-		}
-		
-		private function _registerUserChange(key:String, value:Object):void {
+		/**
+		 * Called when user changes current value inside a generated component. Causes the 
+		 * corresponding originator class member's value to change accordingly. 
+		 */
+		private function _onUserChange(key:String, value:Object):void {
 			_originator[key] = value;
+			if (_externalChangeCallback != null) {
+				_externalChangeCallback (key, value);
+			}
 		}
-		
 	}
 }
