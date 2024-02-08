@@ -1,0 +1,405 @@
+UI Generator Library
+====================
+
+This is a library that uses AS3 reflection to build a basic UI made out of visual components that bind back to reflected class' respective public members. A number of supported custom annotations make the resulting UI more flexible, to the point that custom components can also be used.
+
+The library "feeds" on class instances and (given some functionality loss) simple Objects. When taking class instances as sources, Flex style annotations are needed (e.g., [MyAnnotation(myKey="myValue")]) and a compiler that can understand and preserve them in the resulting bytecode. With "mxmlc" (the default Flex AS3 compiler) this is achievable by adding the compiler argument:
+
+-keep-as3-metadata+=MyAnnotation1,MyAnnotation2,MyAnnotationN
+
+In Flash Builder (the classic Flex IDE) this would be added under "Properties" -> "Flex Compiler"->"Additional compiler arguments".
+
+When using a simple Object as a source (or "originator" as called from this point onward), you substitute the annotations for a special property that you add to your Object to house the full tree of configurations.
+
+The library mainly targets Flex, but other UI libraries can also be used (e.g., Starling/Feathers) if appropriated builders (implementors of IUiBuilder) are provided. The Flex implementation is contained in the "UiFlexBuilder", so that the rest of the library is completely agnostic in regard to Flex. Some functionalities (such as two-way binding) might only be available in Flex, though.
+
+
+Library Organization
+--------------------
+The library spans three SWCs, each having specific roles:
+
+- ui-generator-library.swc: provides the core functionality and is contains no Flex code or references; you can use it with other UI libraries as well (e.g., Starling/Feathers);
+
+- ui-generator-library-base.swc: contains constant classes and the IUiBuilder interface that you will employ to use the library in a no-Flex environment. The constants are already used by the core functionality (ui-generator-library.swc) and the idea is to use them in your custom builder (IUiBuilder implementor) if you need to build one. Therefore, the only dependency you need to add to your custom builder project is ui-generator-library-base.swc (no need to add the ui-generator-library.swc);
+
+- ui-generator-flex-builder.swc: Flex specific complimentary implementation, provides the UiFlexBuilder class (a IUiBuilder implementor) which you can inject into the UiGenerator class (found in ui-generator-library.swc) via a constructor argument. Uses Flex 4.* components to render numeric steppers, horizontal sliders, text inputs, check boxes, combo boxes (aka drop-down lists) and lists with multiple selection support -- and, of course, labels for all of them.
+
+There is also a "ui-generator-library-tester" containing test AIR applications which you may find useful to conduct your own testing.
+
+
+How to Use
+----------
+You should refer to the examples in the "ui-generator-library-tester" folder. Mainly, given that you have an ActionScript class with public accessors, such as:
+
+package {
+	
+	/**
+	 * Class with public accessors for testing the UI Generator library.
+	 */
+	public class MyClass {
+		
+		private var _myNumber : Number = 10;
+		
+		[Bindable]
+		public function set myNumber (value : Number) : void {
+			_myNumber = value;
+		}
+
+		public function get myNumber() : Number {
+			return _myNumber;
+		}
+	}
+}
+
+You should be able to render it in any DisplayObjectContainer subclass by (examples given for Flex only):
+
+<?xml version="1.0" encoding="utf-8"?>
+<s:WindowedApplication xmlns:fx="http://ns.adobe.com/mxml/2009" 
+					   xmlns:s="library://ns.adobe.com/flex/spark" 
+					   xmlns:mx="library://ns.adobe.com/flex/mx"
+					   initialize="_onInitialize (event)">
+	
+	<fx:Script>
+		<![CDATA[
+			import flash.events.Event;
+			import ro.ciacob.desktop.ui.UiGenerator;
+			import ro.ciacob.desktop.ui.UiFlexBuilder;
+
+			private var _uiGenerator : UiGenerator;
+			private var _classToRender : SampleClass;
+
+			private function _onInitialize (event:Event) : void {
+				_uiGenerator = new UiGenerator (UiFlexBuilder);
+				_generate ();
+			}
+			
+			private function _onRenderingComplete () : void {
+				trace ("Generating UI Components done.");
+			}
+
+			private function _generate () : void {
+				_uiGenerator.generate (_classToRender, renderingArea, _onRenderingComplete);
+			}
+		]]>
+	</fx:Script>
+
+	<s:Group id="renderingArea" top="10" bottom="10" left="10" right="10">
+		<s:layout>
+			<s:VerticalLayout horizontalAlign="justify" gap="10" />
+		</s:layout>
+	</s:Group>
+</s:WindowedApplication>
+
+The above should produce a NumericStepper component with a default value of `10`, with default limits (0, 10) and a fractional step (0.01). A label reading "My Number:" should be placed before it. Read the rest of the documentation to learn how to customize the output.
+
+
+How it Works
+------------
+The UiGenerator uses reflection on class instances and property enumeration on Objects to inspect one given entity (the `originator`) and to generate UI components it then adds as children of a given container (the `container`). 
+
+User interactions on the generated UI are automatically observed and translated into value changes of the originator`s members. FLEX ONLY: programmatic changes of the originator's member values are observed, and cause the generated controls to update their values or selection (where applicable).
+	 
+Supported originators:
+- class instances that have at least one public getter/setter pair (aka readwrite "accessor") of one of the supported types (see below). Note that choice lists require a third element, a getter (readonly accessor) named [SAME_NAME]Src; note that public variables are NOT rendered, e.g.:
+	
+	// This will be ignored
+	public var myNumber : Number = 3;
+
+- simple Objects, that have at least one property of a supported type (see below). Using simple Objects instead of class instances comes with these limitations: (1) binding is not available (only relevant if you were using Flex, otherwise binding is not available anyway), and (2) choice lists must be populated from source Arrays that contain Object items (or otherwise, you cannot have a default selection).
+
+Supported types:
+- Boolean
+  Generated as a checkbox.
+
+- String
+  Generated as an input text box.
+
+- Number, Integer or Unsigned Integer
+  Generated as either a  numeric stepper or a slider, based on additional configuration. Decimals will be accepted or not based on accessor type and additional configuration.
+
+- Object
+  Generated as a single selection list (aka combo box); a readonly accessor named [SAME_NAME]Src is required to provide the options for the list. If a matching readonly accessor is not given, the generated combo box will be empty. Example (using class instance originator):
+
+  	  // If using the UiFlexBuilder, this will render as a
+  	  // ComboBox component with the available options "red",
+  	  // "green" and "blue". Upon choosing an option, the 
+  	  // corresponding Object inside `_choices` will be assigned
+  	  // to `_myChoice`
+	  private var _myChoice : Object;
+	  private const _choices : Array = [
+	  	{ label: "red", hex: 0xff0000 },
+	  	{ label: "green", hex: 0x00ff00 },
+	  	{ label: "blue", hex: 0x0000ff }
+	  ];
+
+	  [Bindable]
+	  public function set myChoice (value : Object) : void {
+	  	_myChoice = value;
+	  }
+	  public function get myChoice () : Object {
+	  	return _myChoice;
+	  }
+	  public function get myChoiceSrc () : Array {
+	  	return _choices;
+	  }
+
+- Array
+  Generated as a multiple selection list; a readonly accessor named [SAME_NAME]Src is required to provide the options for the list. Functionality is similar to that provided for Object accessors, except multiple selection is available.
+
+Note: when using class instance originators, any data type can be used inside the source Arrays. If Objects are used, they must provide a "label" field that contains the text to be shown in the list. When using simple Object originators, the source Arrays should only use Object items, or else you won't be able to set a default selection for the generated bombo box or list.
+
+Note: the readonly source Array controlls the generated combo box or list options, while the readwrite accessor controls its selection. When the source Array contains Object items, you need to provide references to the exact same Object in order to set or modify the selection programmatically. Example:
+
+	// RIGHT: this successfully sets the default
+	// selection to "green", because a referrence
+	// from the source Array is used:
+	private const _choices : Array = [
+		{ label: "red", hex: 0xff0000 },
+		{ label: "green", hex: 0x00ff00 },
+		{ label: "blue", hex: 0x0000ff }
+	];
+	private var _myChoice : Object = _choices[1];
+	// ...
+	public function get myChoiceSrc () : Array {
+		return _choices;
+	}
+
+	// WRONG: this fails to set the default selection
+	// to "green". Although identical, the Object 
+	// assigned to `_myChoice` is not a referrence from
+	// the source Array:
+	private const _choices : Array = [
+		{ label: "red", hex: 0xff0000 },
+		{ label: "green", hex: 0x00ff00 },
+		{ label: "blue", hex: 0x0000ff }
+	];
+	private var _myChoice : Object = {
+		label: "green", hex: 0x00ff00
+	};
+	// ...
+	public function get myChoiceSrc () : Array {
+		return _choices;
+	}
+
+The same considerations apply in regard to binding (only available in Flex, when using the UiFlexBuilder builder). If you want to programmatically change the selection of a generated combo box or list, set your readwrite accessor value to one (or more) of the source Array items, by referencing them directly. Using identical Objects will not work.
+
+
+Customizing/Controling the Output
+---------------------------------
+i. configuration basics
+A number of aspects of the generated UI components can be controlled by appropriately configuring the library. Configuration is done by annotating the originator classes with Flex style metadata tags, e.g.:
+
+	[Description(value="Please provide your first name.")]
+	public function set firstName (value : String) : void {
+		_userFirst = value 
+	}
+	public function get firstName () : String {
+		return _userFirst
+	}
+
+or providing a special "uiGeneratorConfig" member in originator simple Objects, e.g.:
+
+	private const _userInfo : Object = {
+		firstName : '',
+		lastName : '',
+
+		// etc...
+
+		uiGeneratorConfig : {
+			firstName: { Description: "Please provide your first name." }
+		}
+	};
+
+No "uiGeneratorConfig" member is observed in class instance originators. You can only use metadata annotations in class instances.
+
+
+ii. available configuration annotations/properties
+Note that the UiGenerator DOES NOT DEPEND on the metadata annotations or properties being provided. Generating the UI components will still proceed, even with no configuration at all. The the library does provide good defaults, but they come with some limitations.
+
+Below is the list of recognized annotations/properties that can be used for configuring the generated UI components.
+
+- "Index": establishes the order generated UI components are to be added to the target container. The value must be a positive integer. The indices need not be consecutive. If omitted, generated UI components will be ordered alphabetically, by their labels;
+
+- "Description": provides documentation for the generated UiComponent. When using Flex and the UiFlexBuilder, this will show as a tooltip when hovering the component's label. The special syntax [<<accessorName>>] can be used within the descriptive text to make references to other accessors. The "raw" accessor name is to be used, it will be expanded by the labeling rules. Accessors providing no description will produce undocumented UI components;
+
+- "Minimum" and "Maximum": when using Flex and the UiFlexBuilder, for every readwrite accessor of types Number, int or uint, one NumericStepper component is to be generated by default; "Minimum" and "Maximum" set the lowest and highest acceptable values that the user can enter in the generated component. Example:
+
+  [Minimum(value="-5")]
+  [Maximum(value="7")]
+  public function set myNumber (value : Number) : void {
+  	_mynumber = value;
+  }
+
+Defaults are `int.MIN_VALUE` and `int.MAX_VALUE`, that is `-2147483647` and `2147483647` respectively. Beware not to use negative values with uint accessors, you will get large positive numbers instead.
+
+The accessor type determines the "step" setting of the component: uint and int set it to `1`, whereas Number sets the step to `0.01`.
+
+An accessor of type Number that has a "Minimum" of `0` and a "Maximum" of `1` is rendered as an horizontal slider (HSlider).
+
+If "Minimum" and/or "Maximum" are omitted, (1) the default numeric limits will be used, and (2) no sliders will be employed (all numeric accessors will be rendered as numeric steppers).
+
+- "CustomComponent": used as an extension end-point for all builders that provide the facility of using custom components for rendering the accessors (the UiFlexBuilder does). Its usage is detailed in the section dedicated to using custom components.
+
+
+iii. labeling, ordering and hiding
+Every generated (standard) component will be automatically given a label whose text is the corresponding accessor name "decamelized" (so that "myProperty" becomes "my Property"), capitalized ("my Property" becomes "My Property") and appended a semi-colon (the final text being "My Property:"). By exception, the check box component does not receive a leading label because the component itself contains a label. However, the text for that label is provided by the same algorithm outlined before.
+
+To cope with figures or to eschew title case, underscores can be used also in accessor's names. They will be replaced by spaces when infering a generated component's label ("tick_the_checkbox_if_you_are_John" becomes "Tick the checkbox if you are John" and "myObject_2" becomes "My Object 2").
+
+By default, accessors are rendered alphabetically (sorted by the name of their labels); for better control you can use the "Index" configuration to specify their exact order. Example (as custom metadata):
+
+	[Index(value="0")]
+	public function set myNumber (value : Number) : void {
+		_myNumber = value;
+	}
+
+To HIDE a public, readwrite accessor (i.e., prevent it from being rendered as a UI component), prefix its name with the "$" char, e.g.:
+
+	public var function set $myNumber (value : Number) : void { }
+	public var function get $myNumber () : Number { }
+
+The same applies to simple Object originators. In class instances, you can also use public variables, they will be ignored as well.
+
+
+iv. further tweaking
+Generated components are accessible via standard AS3 API, so "getChildByName(<<accessorName>>)" will give you an instance of the gneratedUI component you can further manipulate. There is also a "getComponentByName(<<accessorName>>)" method in class UiGenerator provides the same functionality, only faster.
+
+Some customization can also be achieved by tweaking the container UI components are generated in, e.g., in Flex you could add and configure different layouts to achieve different paginations of the generated components. As an alternative, you can use custom components or implement and use a builder (IUiBuilder) implementor that provides superior control over the resulting components' appearance and layout.
+
+
+Using Binding
+-------------
+Within the scope of this library, "binding" shall refer to the process of automatically updating the displayed value of a generated UI component when the value of its originating readwrite accessor changes.
+
+Binding is a Flex specific functionality. By default, it will only be available when using Flex, the UiFlexBuilder and a class instance as an originator. In this setup, no configuration should be necesary for binding to work, only a couple precautions:
+
+- don't forget to set the "[Bindable]" metadata tag on the setter of the public readwrite accessor you need to bind, e.g.:
+
+		private var _myNumber : Number;
+
+		[Bindable]
+		[Minimum(value="0")]
+		[Maximum(value="1")]
+		public function set myNumber (value : Number) : void {
+			_myNumber = value;
+		}
+		public function get myNumber() : Number {
+			return _myNumber;
+		}
+
+- when programmatically changing a readwrite accessor's value, make sure you do it through its public setter; in the above example, directly changing the `_myNumber` private variable won't work;
+- for Object or Array accessors, binding links to generated component's selection, not available options. If you need to programmatically update the avaiable options, you will need to either re-generate or manually interacting with the generated component;
+- see the explanation already given in the "How it Works" section regarding the Object and Array accessor types (you need to directly reference their source options for binding to work).
+
+Binding should also work when using custom components, provided it has been correctly configured (see the section on "Using Custom Components").
+
+Binding is unavailable when using simple Object originators. In this situation, you can either manually trigger the process of re-generating the UI components when their underlying properties change value, or manually set the new value(s) on the generated components (see "iv. further tweaking" for information on how to access them).
+
+
+Using Custom Components
+-----------------------
+When using Flex and the UiFlexBuilder, you are not limited to the set of predefined Flex components normally used for the supported accessor types (Label, TextInput, CheckBox, NumericStepper, HSlider, BomboBox, List).
+
+You can tell the builder to use any valid IVisualElement implementor for rendering a particular accessor, by configuring it with the "CustomComponent" metadata annotation/property. Example using a class instance originator:
+
+		private var _myNumber : Number = 10;
+		
+		[Bindable]
+		[CustomComponent(classFqn="custom_components.NonEditableNumericStepper",dataproviderName="value",minimum="-10",maximum="100")]
+		public function set myNumber (value : Number) : void {
+			_myNumber = value;
+		}
+		public function get myNumber() : Number {
+			return _myNumber;
+		}
+
+Example using a simple Object originator:
+
+		private const _sourceObject : Object = {
+			myNumber : 10,
+
+			// Other propertis go here
+
+			// Configurations go here
+			uiGeneratorConfig : {
+				myNumber: { 
+					CustomComponent: {
+						classFqn: "custom_components.NonEditableNumericStepper",
+						dataproviderName: "value",
+						minimum: -10,
+						maximum: 100
+					}
+				},
+			}
+		};
+
+As already depicted, "CustomComponent" accepts an arbitrary number of keys, out of which only one ("classFqn") is required. In all, there are six keys that are "known" to the UiFlexBuilder and perform specific tasks. They are listed in the folowing table. Any other given key is assumed to be a public setter of the component's class and is passed on to the component, unchanged.
+
+- "classFqn": Mandatory, must be set to the fully qualified class name of the custom component to be used, e.g., "custom_components.NonEditableNumericStepper". The provided string must correctly point to an accessible class definition, and you must ensure that the compiler will include and compile that class (or else the UiFlexBuilder will not be able to instantiate it). To achieve that, declare a (possibly unused) variable of the needed type, e.g.:
+
+	<s:WindowedApplication xmlns:fx="http://ns.adobe.com/mxml/2009" 
+						   xmlns:s="library://ns.adobe.com/flex/spark" 
+						   xmlns:mx="library://ns.adobe.com/flex/mx"
+						   initialize="_onInitialize (event)">
+
+		<fx:Script>
+			<![CDATA[
+
+				import flash.events.Event;
+				import custom_components.NonEditableNumericStepper;
+				import ro.ciacob.desktop.ui.UiFlexBuilder;
+				import ro.ciacob.desktop.ui.UiGenerator;
+
+				private var _uiGenerator : UiGenerator;
+				private var _classToRender : SampleClass2;
+
+				// ENSURE OUR CUSTOM COMPONENT CLASS GETS COMPILED
+				private var compiler_helper : NonEditableNumericStepper;
+
+				private function _onInitialize (event:Event) : void {
+					_uiGenerator = new UiGenerator (UiFlexBuilder);
+					_classToRender = new SampleClass2;
+					_uiGenerator.generate (_classToRender, renderingArea, _onRenderingComplete);
+				}
+
+				private function _onRenderingComplete () : void {
+					trace ("Generating UI Components done.");
+				}
+
+			]]>
+		</fx:Script>
+
+		<!-- Area for generated UI Components -->
+		<s:Group id="renderingArea">
+			<s:layout>
+				<s:VerticalLayout horizontalAlign="justify" gap="10" paddingRight="10" />
+			</s:layout>
+		</s:Group>
+
+	</s:WindowedApplication>
+
+If UiFlexBuilder is not able to instantiate the class of your custom component it will silently move on to the next accessor. The resulting error is only printed to console in Debug mode;
+
+- "hideLabel": optional, defaults to "false"; if you want the UiFlexBuilder NOT to provide a label to your custom component (maybe it provides its own label, or doesn't need one), set this to the String "true";
+
+- "dataproviderName": optional, defaults to "dataProvider"; can be given the name of the public property that represents the "value" or "data" held by your component. For example sake, if you were to use standard Flex components such as List or NumericStepper, you would set "dataproviderName" to "dataProvider" or "value" respectively;
+
+- "bindingSource": optional, defaults to the accessor name; can be set to the name of one of the originator's accessors that is to be "watched" for value changes. The Binding functionality (described earlier) converts these changes in updates of the generated component's UI. Setting "bindingSource" is rarely needed, but can come in handy if you need to "translate" or "convert" incoming data before populating your generated component with it. In this corner case scenario, you could implement a dedicated originator setter that receives the converted data, and use that setter as a "bindingSource". See more about Binding in its dedicated section;
+
+- "bindingTarget": optional, defaults to the current value of "dataproviderName"; you only need to set this for list-like components, i.e., components that maintain two distinct datasets, a "source" and a "selection". As the "selection" dataset uses its own, dedicated setter, you will need to target that one for Binding to work. For example sake, if you were to use standard Flex components such as ComboBox or List, you would set "bindingTarget" to "selectedItem" or "selectedItems" respectively. The UiFlexBuilder can differentiate between components that employ selection and components that do not, based on the availability (or lack thereof) of a matching source getter (a readonly accessor named <<accessor_name>>Src, see the notes on "Object" and "Array" in the "Supported types" section). If the current component does not employ selection, "bindingTarget" will be ignored and the current value of "dataproviderName" will be used instead;
+
+- "changeEventName": optional, defaults to "change" (the value of the `flash.events.Event.CHANGE` constant). Can be set to the name of the Event your component dispatches when its internal state changes in response to end-user interaction. It is asummed that querying the component's "dataproviderName" public property before and after an Event of the "changeEventName" type yelds different results. For example sake, if you were to use standard Flex components such as List or NumericStepper, you would set "changeEventName" to `flash.events.Event.CHANGE`. If a your component does not dispatch an Event, then you will need to manually update the corresponding originator accessor via other means.
+
+Note that you do not HAVE to create custom components for use with the "CustomComponent" metadata annotation/property. You can use standard components just as well. For instance, you can use a TextArea to render a specific String accessor in your originator (as opposed to using a TextInput, which is the default):
+
+
+	private var _userResume : String;
+	
+	[Bindable]
+	[CustomComponent(classFqn="spark.components.TextArea",dataproviderName="text")]
+	public function set shortResume (value : String) : void {
+		_userResume = value;
+	}
+	public function get shortResume() : String {
+		return _userResume;
+	}
